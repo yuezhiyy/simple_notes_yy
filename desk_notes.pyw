@@ -1,9 +1,8 @@
 """桌面右侧备忘。
 
-黄点贴在屏幕右缘，点一下把清单拉出来。左侧圆圈切换状态，拖动手柄调顺序，
-右边垃圾桶只归档，连日期一起记在本机 CSV 里，不真删。
+黄点贴在屏幕右缘，点一下把清单拉出来。左侧圆圈切换：待办 → 正在做 → 完成；右边垃圾桶只归档，
+连写下时间和归档时间一起记在本机 CSV 里，不真删。
 
-状态：待办 → 正在做 → 完成（点圆圈循环；同时只允许一条「正在做」）
 CSV：本目录 data\\notes.csv（记事本 / Excel / WPS 都能直接打开）
 """
 
@@ -21,6 +20,7 @@ from pathlib import Path
 
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import messagebox
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -30,7 +30,7 @@ LEGACY_XLSX_PATH = DATA_DIR / "notes.xlsx"
 LEGACY_DB_PATH = DATA_DIR / "notes.db"
 LOG_PATH = DATA_DIR / "error.log"
 
-HEADERS = ("ID", "内容", "状态", "顺序", "写下时间", "更新时间", "归档时间")
+HEADERS = ("ID", "内容", "状态", "写下时间", "更新时间", "归档时间")
 STATUS_TODO = "todo"
 STATUS_DOING = "doing"
 STATUS_DONE = "done"
@@ -56,7 +56,6 @@ MUTED = "#8E8578"
 LINE = "#F0E6D4"
 ROW_HOVER = "#FFF6DE"
 DOING_ROW = "#FFF8E3"
-DRAG_ROW = "#FFE8A8"
 DONE_FG = "#A89B8A"
 DOING_FG = "#8A6A12"
 INPUT_BG = "#FFF3C9"
@@ -120,6 +119,8 @@ _USER32.SystemParametersInfoW.argtypes = [
     wintypes.UINT,
 ]
 _USER32.SystemParametersInfoW.restype = wintypes.BOOL
+_USER32.LockWindowUpdate.argtypes = [ctypes.c_void_p]
+_USER32.LockWindowUpdate.restype = wintypes.BOOL
 
 _GDI32.CreateEllipticRgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 _GDI32.CreateEllipticRgn.restype = ctypes.c_void_p
@@ -226,16 +227,12 @@ class Store:
         self.notes: list[dict] = []
         if path.exists():
             self.notes = self._load_csv(path)
-            self._normalize_sort()
-            self._save()
         elif LEGACY_XLSX_PATH.exists():
             self.notes = self._load_xlsx(LEGACY_XLSX_PATH)
-            self._normalize_sort()
             self._save()
             self._backup(LEGACY_XLSX_PATH)
         elif LEGACY_DB_PATH.exists():
             self.notes = self._load_sqlite(LEGACY_DB_PATH)
-            self._normalize_sort()
             self._save()
             self._backup(LEGACY_DB_PATH)
         else:
@@ -245,9 +242,7 @@ class Store:
         self._save()
 
     def active_notes(self) -> list[dict]:
-        active = [note for note in self.notes if not note["deleted_at"]]
-        active.sort(key=lambda note: (int(note["sort"]), int(note["id"])))
-        return [dict(note) for note in active]
+        return [dict(note) for note in self.notes if not note["deleted_at"]]
 
     def archived_notes(self) -> list[dict]:
         archived = [dict(note) for note in self.notes if note["deleted_at"]]
@@ -261,9 +256,10 @@ class Store:
                 archived += 1
                 continue
             active += 1
-            if note["status"] == STATUS_DOING:
+            status = note.get("status", STATUS_TODO)
+            if status == STATUS_DOING:
                 doing += 1
-            elif note["status"] != STATUS_DONE:
+            elif status != STATUS_DONE:
                 pending += 1
         return active, pending, doing, archived
 
@@ -273,7 +269,6 @@ class Store:
             "id": self._next_id(),
             "content": content[:4000],
             "status": STATUS_TODO,
-            "sort": self._next_sort(),
             "created_at": stamp,
             "updated_at": stamp,
             "deleted_at": None,
@@ -294,32 +289,8 @@ class Store:
         note = self._find(note_id)
         if note is None or status not in STATUS_LABEL:
             return
-        if status == STATUS_DOING:
-            for other in self.notes:
-                if (
-                    other["id"] != note_id
-                    and not other["deleted_at"]
-                    and other["status"] == STATUS_DOING
-                ):
-                    other["status"] = STATUS_TODO
-                    other["updated_at"] = now_text()
         note["status"] = status
         note["updated_at"] = now_text()
-        self._save()
-
-    def reorder(self, note_ids: list[int]) -> None:
-        stamp = now_text()
-        by_id = {int(note["id"]): note for note in self.notes if not note["deleted_at"]}
-        for index, note_id in enumerate(note_ids):
-            note = by_id.get(int(note_id))
-            if note is None:
-                continue
-            note["sort"] = index
-            note["updated_at"] = stamp
-        leftovers = [note for note in self.notes if not note["deleted_at"] and int(note["id"]) not in {int(i) for i in note_ids}]
-        for offset, note in enumerate(leftovers):
-            note["sort"] = len(note_ids) + offset
-            note["updated_at"] = stamp
         self._save()
 
     def archive(self, note_id: int) -> None:
@@ -336,22 +307,19 @@ class Store:
         if note is None:
             return
         note["deleted_at"] = None
-        note["sort"] = self._next_sort()
         note["updated_at"] = now_text()
         self._save()
 
+    def purge(self, note_id: int) -> bool:
+        note = self._find(note_id)
+        if note is None:
+            return False
+        self.notes = [item for item in self.notes if int(item["id"]) != int(note_id)]
+        self._save()
+        return True
+
     def _next_id(self) -> int:
         return max((int(note["id"]) for note in self.notes), default=0) + 1
-
-    def _next_sort(self) -> int:
-        active = [int(note["sort"]) for note in self.notes if not note["deleted_at"]]
-        return (max(active) + 1) if active else 0
-
-    def _normalize_sort(self) -> None:
-        active = [note for note in self.notes if not note["deleted_at"]]
-        active.sort(key=lambda note: (int(note.get("sort", 10**9)), int(note["id"])))
-        for index, note in enumerate(active):
-            note["sort"] = index
 
     def _find(self, note_id: int) -> dict | None:
         for note in self.notes:
@@ -364,20 +332,12 @@ class Store:
         with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(HEADERS)
-            for note in sorted(
-                self.notes,
-                key=lambda item: (
-                    0 if not item["deleted_at"] else 1,
-                    int(item["sort"]),
-                    int(item["id"]),
-                ),
-            ):
+            for note in sorted(self.notes, key=lambda item: int(item["id"])):
                 writer.writerow(
                     [
                         int(note["id"]),
                         note["content"],
-                        STATUS_LABEL.get(note["status"], "待办"),
-                        int(note["sort"]),
+                        STATUS_LABEL.get(note.get("status", STATUS_TODO), "待办"),
                         note["created_at"] or "",
                         note["updated_at"] or "",
                         note["deleted_at"] or "",
@@ -389,28 +349,48 @@ class Store:
         with path.open("r", encoding="utf-8-sig", newline="") as fh:
             rows = list(csv.DictReader(fh))
         notes: list[dict] = []
-        for index, item in enumerate(rows):
+        for item in rows:
             note_id = item.get("ID", item.get("id"))
             if note_id is None or str(note_id).strip() == "":
                 continue
             content = str(item.get("内容", item.get("content", "")) or "").strip()
-            sort_raw = item.get("顺序", item.get("sort", index))
-            try:
-                sort_val = int(float(str(sort_raw).strip() or index))
-            except ValueError:
-                sort_val = index
             notes.append(
                 {
                     "id": int(note_id),
                     "content": content,
                     "status": self._parse_status(item),
-                    "sort": sort_val,
                     "created_at": self._cell_text(item.get("写下时间", item.get("created_at"))),
                     "updated_at": self._cell_text(item.get("更新时间", item.get("updated_at"))),
                     "deleted_at": self._cell_text(item.get("归档时间", item.get("deleted_at"))) or None,
                 }
             )
         return notes
+
+    @staticmethod
+    def _parse_status(item: dict) -> str:
+        status = item.get("状态", item.get("status", None))
+        if status is not None and str(status).strip() != "":
+            text_v = str(status).strip().lower()
+            mapping = {
+                "todo": STATUS_TODO,
+                "待办": STATUS_TODO,
+                "否": STATUS_TODO,
+                "0": STATUS_TODO,
+                "doing": STATUS_DOING,
+                "正在做": STATUS_DOING,
+                "进行中": STATUS_DOING,
+                "done": STATUS_DONE,
+                "完成": STATUS_DONE,
+                "是": STATUS_DONE,
+                "1": STATUS_DONE,
+                "yes": STATUS_DONE,
+                "true": STATUS_DONE,
+            }
+            return mapping.get(text_v, mapping.get(str(status).strip(), STATUS_TODO))
+        done_raw = item.get("完成", item.get("done", ""))
+        if str(done_raw).strip() in {"1", "是", "true", "True", "YES", "yes", "完成", "done"}:
+            return STATUS_DONE
+        return STATUS_TODO
 
     def _load_xlsx(self, path: Path) -> list[dict]:
         from openpyxl import load_workbook
@@ -422,7 +402,7 @@ class Store:
             return []
         header = [str(cell or "").strip() for cell in rows[0]]
         notes: list[dict] = []
-        for index, raw in enumerate(rows[1:]):
+        for raw in rows[1:]:
             if raw is None or all(cell is None or str(cell).strip() == "" for cell in raw):
                 continue
             item = dict(zip(header, raw))
@@ -435,7 +415,6 @@ class Store:
                     "id": int(note_id),
                     "content": content,
                     "status": self._parse_status(item),
-                    "sort": index,
                     "created_at": self._cell_text(item.get("写下时间", item.get("created_at"))),
                     "updated_at": self._cell_text(item.get("更新时间", item.get("updated_at"))),
                     "deleted_at": self._cell_text(item.get("归档时间", item.get("deleted_at"))) or None,
@@ -446,47 +425,19 @@ class Store:
     def _load_sqlite(self, path: Path) -> list[dict]:
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
-        rows = []
-        for index, row in enumerate(conn.execute("SELECT * FROM notes ORDER BY id ASC")):
-            done = int(row["done"] or 0)
-            rows.append(
-                {
-                    "id": int(row["id"]),
-                    "content": row["content"],
-                    "status": STATUS_DONE if done else STATUS_TODO,
-                    "sort": index,
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                    "deleted_at": row["deleted_at"],
-                }
-            )
+        rows = [
+            {
+                "id": int(row["id"]),
+                "content": row["content"],
+                "status": STATUS_DONE if int(row["done"] or 0) else STATUS_TODO,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "deleted_at": row["deleted_at"],
+            }
+            for row in conn.execute("SELECT * FROM notes ORDER BY id ASC")
+        ]
         conn.close()
         return rows
-
-    @staticmethod
-    def _parse_status(item: dict) -> str:
-        raw = item.get("状态", item.get("status", None))
-        if raw is None or str(raw).strip() == "":
-            done_raw = item.get("完成", item.get("done", ""))
-            text = str(done_raw).strip()
-            if text in {"1", "是", "true", "True", "YES", "yes", "完成", "done"}:
-                return STATUS_DONE
-            return STATUS_TODO
-        text = str(raw).strip().lower()
-        mapping = {
-            "todo": STATUS_TODO,
-            "待办": STATUS_TODO,
-            "否": STATUS_TODO,
-            "0": STATUS_TODO,
-            "doing": STATUS_DOING,
-            "正在做": STATUS_DOING,
-            "进行中": STATUS_DOING,
-            "done": STATUS_DONE,
-            "完成": STATUS_DONE,
-            "是": STATUS_DONE,
-            "1": STATUS_DONE,
-        }
-        return mapping.get(text, mapping.get(str(raw).strip(), STATUS_TODO))
 
     @staticmethod
     def _backup(path: Path) -> None:
@@ -514,19 +465,11 @@ class NoteRow(tk.Frame):
         self.app = app
         self.note_id = int(note["id"])
         self.status = note.get("status", STATUS_TODO)
+        if self.status not in STATUS_LABEL:
+            self.status = STATUS_TODO
         self._row_bg = PAPER
         self._trash_hover = False
-        self._dragging = False
 
-        self.handle = tk.Canvas(
-            self,
-            width=app.px(16),
-            height=app.px(28),
-            bg=PAPER,
-            highlightthickness=0,
-            bd=0,
-            cursor="fleur",
-        )
         self.check = tk.Canvas(
             self,
             width=app.px(28),
@@ -559,21 +502,19 @@ class NoteRow(tk.Frame):
         )
         self.sep = tk.Frame(self, bg=LINE, height=1)
 
-        self.handle.place(x=app.px(4), rely=0.5, anchor="w", width=app.px(16), height=app.px(28))
-        self.check.place(x=app.px(22), rely=0.5, anchor="w", width=app.px(28), height=app.px(28))
+        self.check.place(x=app.px(12), rely=0.5, anchor="w", width=app.px(28), height=app.px(28))
         self.trash.place(relx=1, x=-app.px(6), rely=0.5, anchor="e", width=app.px(32), height=app.px(32))
         self.entry.place(
-            x=app.px(56),
+            x=app.px(46),
             rely=0.5,
             anchor="w",
             relwidth=1,
-            width=-app.px(56 + 44),
+            width=-app.px(46 + 44),
         )
         self.sep.place(x=app.px(16), rely=1.0, y=-1, relwidth=1, width=-app.px(32), height=1)
 
         self.entry.insert(0, note["content"])
         self.apply_status(self.status)
-        self.draw_handle()
         self.entry.bind("<KeyRelease>", lambda _e: app.schedule_save(self.note_id))
         self.entry.bind("<<Paste>>", self._on_paste)
         self.entry.bind("<FocusOut>", lambda _e: app.save_content(self.note_id))
@@ -581,14 +522,9 @@ class NoteRow(tk.Frame):
         self.trash.bind("<Button-1>", self._on_trash)
         self.trash.bind("<Enter>", self._trash_enter)
         self.trash.bind("<Leave>", self._trash_leave)
-        self.handle.bind("<ButtonPress-1>", self._on_drag_start)
-        self.handle.bind("<B1-Motion>", self._on_drag_motion)
-        self.handle.bind("<ButtonRelease-1>", self._on_drag_end)
         self._bind_hover()
 
     def base_bg(self) -> str:
-        if self._dragging:
-            return DRAG_ROW
         if self.status == STATUS_DOING:
             return DOING_ROW
         return PAPER
@@ -602,24 +538,9 @@ class NoteRow(tk.Frame):
         else:
             fg, font = INK, self.app.font_body
         self.entry.configure(fg=fg, font=font)
-        if not self._dragging:
-            self._set_bg(self.base_bg())
+        self._set_bg(self.base_bg())
         self.draw_check()
         self.draw_trash()
-        self.draw_handle()
-
-    def draw_handle(self) -> None:
-        canvas = self.handle
-        canvas.delete("all")
-        color = "#C4B79F" if self.status != STATUS_DOING else "#C9A84A"
-        width = max(canvas.winfo_width(), self.app.px(16))
-        height = max(canvas.winfo_height(), self.app.px(28))
-        cx = width / 2
-        for row in (-5, 0, 5):
-            for col in (-2.5, 2.5):
-                x = cx + col
-                y = height / 2 + row
-                canvas.create_oval(x - 1.2, y - 1.2, x + 1.2, y + 1.2, fill=color, outline="")
 
     def draw_check(self) -> None:
         canvas = self.check
@@ -693,28 +614,22 @@ class NoteRow(tk.Frame):
         self.configure(bg=color)
         self.entry.configure(bg=color)
         self.check.configure(bg=color)
-        self.handle.configure(bg=color)
         if not self._trash_hover:
             self.trash.configure(bg=color)
         self.draw_check()
-        self.draw_handle()
 
     def _bind_hover(self) -> None:
         def enter(_event=None) -> None:
-            if self._dragging:
-                return
             self._set_bg(ROW_HOVER)
 
         def leave(_event=None) -> None:
-            if self._dragging:
-                return
             x, y = self.winfo_pointerxy()
             target = self.winfo_containing(x, y)
             if target is not None and self._is_inside(target):
                 return
             self._set_bg(self.base_bg())
 
-        for widget in (self, self.handle, self.check, self.entry, self.trash):
+        for widget in (self, self.check, self.entry, self.trash):
             widget.bind("<Enter>", enter, add="+")
             widget.bind("<Leave>", leave, add="+")
 
@@ -730,22 +645,6 @@ class NoteRow(tk.Frame):
     def _on_trash(self, _event) -> str:
         self.app.archive_note(self.note_id)
         return "break"
-
-    def _on_drag_start(self, event) -> str:
-        self.app.begin_drag(self.note_id, event)
-        return "break"
-
-    def _on_drag_motion(self, event) -> str:
-        self.app.drag_to(event)
-        return "break"
-
-    def _on_drag_end(self, _event) -> str:
-        self.app.end_drag()
-        return "break"
-
-    def set_dragging(self, dragging: bool) -> None:
-        self._dragging = dragging
-        self._set_bg(self.base_bg())
 
     def _trash_enter(self, _event) -> None:
         self._trash_hover = True
@@ -809,7 +708,6 @@ class DeskNotes(tk.Tk):
         self._undo_id: int | None = None
         self._toast_after: str | None = None
         self._menu: tk.Menu | None = None
-        self._drag_id: int | None = None
 
         self.withdraw()
         self.title("桌面备忘")
@@ -1116,30 +1014,68 @@ class DeskNotes(tk.Tk):
             return
         _USER32.SetWindowRgn(hwnd, combined, True)
 
-    def _apply_layout(self) -> None:
-        progress = self._progress
-        if progress <= 0.001:
-            width = height = self.dot
-            self.panel.place_forget()
-        else:
-            width = int(round(self.dot + self.panel_w * progress))
-            height = self.panel_h
-            self.panel.place(x=width - self.panel_w, y=0, width=self.panel_w, height=height)
+    def _shell_geometry(self, open_shell: bool) -> tuple[int, int, int, int]:
         left, top, right, bottom = self.work
+        if open_shell:
+            width = self.dot + self.panel_w
+            height = self.panel_h
+        else:
+            width = height = self.dot
         x = right - width
         y = top + max(0, ((bottom - top) - height) // 2)
-        self.geometry(f"{width}x{height}+{x}+{y}")
+        return width, height, x, y
+
+    def _apply_shell(self, open_shell: bool) -> None:
+        """只在展开/收起起止改窗口尺寸和异形区域，避免动画逐帧 SetWindowRgn 闪烁。"""
+        hwnd = ctypes.c_void_p(self._hwnd) if self._hwnd else None
+        if hwnd:
+            _USER32.LockWindowUpdate(hwnd)
+        try:
+            width, height, x, y = self._shell_geometry(open_shell)
+            if not open_shell:
+                self.panel.place_forget()
+            self.geometry(f"{width}x{height}+{x}+{y}")
+            dot_y = max(0, (height - self.dot) // 2)
+            self.dot_canvas.place(x=0, y=dot_y, width=self.dot, height=self.dot)
+            tk.Misc.lift(self.dot_canvas)
+            self.update_idletasks()
+            self._apply_region(width, height)
+        finally:
+            if hwnd:
+                _USER32.LockWindowUpdate(None)
+
+    def _place_panel(self, progress: float) -> None:
+        """progress: 0=面板在右侧外侧，1=完全展开。只移动控件，不改窗口外形。"""
+        height = self.panel_h
+        panel_x = int(round(self.dot + self.panel_w * (1.0 - progress)))
+        self.panel.place(x=panel_x, y=0, width=self.panel_w, height=height)
         dot_y = max(0, (height - self.dot) // 2)
         self.dot_canvas.place(x=0, y=dot_y, width=self.dot, height=self.dot)
         tk.Misc.lift(self.dot_canvas)
-        self.update_idletasks()
-        self._apply_region(width, height)
+
+    def _apply_layout(self) -> None:
+        if self._progress <= 0.001:
+            self._apply_shell(False)
+            return
+        self._apply_shell(True)
+        self._place_panel(self._progress)
 
     def _animate_to(self, target: float) -> None:
         self._anim_gen += 1
         generation = self._anim_gen
         origin = self._progress
         started = datetime.now().timestamp()
+
+        # 展开：先一次扩成完整窗口，再只滑面板（不逐帧改 region）
+        if target >= 1.0 and origin < 0.999:
+            self._progress = 0.0
+            self._apply_shell(True)
+            self._place_panel(0.0)
+            origin = 0.0
+        # 收起：外壳保持完整，只滑面板，结束后再缩成黄点
+        elif target <= 0.0 and origin > 0.001:
+            self._apply_shell(True)
+            self._place_panel(origin)
 
         def tick() -> None:
             if generation != self._anim_gen:
@@ -1148,10 +1084,17 @@ class DeskNotes(tk.Tk):
             t = min(1.0, elapsed / ANIM_MS)
             eased = 1 - (1 - t) ** 3
             self._progress = origin + (target - origin) * eased
-            self._apply_layout()
+            if self._progress <= 0.001:
+                self.panel.place_forget()
+            else:
+                self._place_panel(max(self._progress, 0.001))
             if t < 1:
                 self.after(12, tick)
-            elif target >= 1 and self.opened and self.mode == "notes":
+                return
+            if target <= 0.0:
+                self._progress = 0.0
+                self._apply_shell(False)
+            elif self.opened and self.mode == "notes":
                 self._focus_composer()
 
         tick()
@@ -1367,68 +1310,8 @@ class DeskNotes(tk.Tk):
         current = row.status if row.status in STATUS_CYCLE else STATUS_TODO
         nxt = STATUS_CYCLE[(STATUS_CYCLE.index(current) + 1) % len(STATUS_CYCLE)]
         self.store.set_status(note_id, nxt)
-        for note in self.store.active_notes():
-            other = self.rows.get(int(note["id"]))
-            if other is not None:
-                other.apply_status(note["status"])
+        row.apply_status(nxt)
         self.refresh_counts()
-
-    def begin_drag(self, note_id: int, _event) -> None:
-        if note_id not in self.rows:
-            return
-        self.flush_saves()
-        self._drag_id = note_id
-        self.rows[note_id].set_dragging(True)
-
-    def drag_to(self, event) -> None:
-        if self._drag_id is None:
-            return
-        order = self._pack_order()
-        if self._drag_id not in order:
-            return
-        y = event.y_root
-        others = [note_id for note_id in order if note_id != self._drag_id]
-        insert_at = len(others)
-        for index, note_id in enumerate(others):
-            row = self.rows[note_id]
-            mid = row.winfo_rooty() + row.winfo_height() // 2
-            if y < mid:
-                insert_at = index
-                break
-        new_order = list(others)
-        new_order.insert(insert_at, self._drag_id)
-        if new_order != order:
-            self._apply_pack_order(new_order)
-
-    def end_drag(self) -> None:
-        if self._drag_id is None:
-            return
-        note_id = self._drag_id
-        self._drag_id = None
-        row = self.rows.get(note_id)
-        if row is not None:
-            row.set_dragging(False)
-        order = self._pack_order()
-        self.store.reorder(order)
-
-    def _pack_order(self) -> list[int]:
-        order: list[int] = []
-        for child in self.list_inner.pack_slaves():
-            if isinstance(child, NoteRow):
-                order.append(child.note_id)
-        return order
-
-    def _apply_pack_order(self, order: list[int]) -> None:
-        for note_id in order:
-            row = self.rows.get(note_id)
-            if row is not None:
-                row.pack_forget()
-        for note_id in order:
-            row = self.rows.get(note_id)
-            if row is not None:
-                row.pack(fill="x")
-        self.list_inner.update_idletasks()
-        self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all") or (0, 0, 0, 0))
 
     def archive_note(self, note_id: int) -> None:
         row = self.rows.get(note_id)
@@ -1543,10 +1426,9 @@ class DeskNotes(tk.Tk):
             fg, font = DOING_FG, self.font_body
         else:
             fg, font = INK, self.font_body
-        badge = STATUS_LABEL.get(status, "待办")
         tk.Label(
             line,
-            text=badge,
+            text=STATUS_LABEL.get(status, "待办"),
             bg=PAPER,
             fg=MUTED,
             font=self.font_meta,
@@ -1559,15 +1441,81 @@ class DeskNotes(tk.Tk):
             font=font,
             anchor="w",
             justify="left",
-            wraplength=max(80, self.panel_w - self.px(160)),
+            wraplength=max(80, self.panel_w - self.px(170)),
         ).pack(side="left", fill="x", expand=True)
-        button = tk.Label(
-            line, text="还原", bg=PAPER, fg=RESTORE, font=self.font_small, cursor="hand2",
-        )
-        button.pack(side="right", padx=(self.px(8), 0))
         note_id = int(note["id"])
-        button.bind("<Button-1>", lambda _e, note_id=note_id: self.restore_note(note_id))
+        trash = tk.Canvas(
+            line,
+            width=self.px(28),
+            height=self.px(28),
+            bg=PAPER,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        trash.pack(side="right", padx=(self.px(2), 0))
+        self._draw_trash_icon(trash, DANGER)
+        trash.bind("<Button-1>", lambda _e, note_id=note_id: self.purge_note(note_id))
+        undo = tk.Label(
+            line,
+            text="↩",
+            bg=PAPER,
+            fg=RESTORE,
+            font=self.font_body,
+            cursor="hand2",
+            padx=self.px(4),
+        )
+        undo.pack(side="right", padx=(self.px(2), 0))
+        undo.bind("<Button-1>", lambda _e, note_id=note_id: self.restore_note(note_id))
         tk.Frame(block, bg=LINE, height=1).pack(fill="x", padx=self.px(18))
+
+    def _draw_trash_icon(self, canvas: tk.Canvas, color: str) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_reqwidth(), self.px(28))
+        height = max(canvas.winfo_reqheight(), self.px(28))
+        unit = width / 28.0
+        cx, cy = width / 2, height / 2 + unit
+        canvas.create_line(
+            cx - 6 * unit, cy - 4 * unit, cx + 6 * unit, cy - 4 * unit,
+            fill=color, width=1, capstyle="round",
+        )
+        canvas.create_line(
+            cx - 2 * unit, cy - 4 * unit,
+            cx - 2 * unit, cy - 6 * unit,
+            cx + 2 * unit, cy - 6 * unit,
+            cx + 2 * unit, cy - 4 * unit,
+            fill=color, width=1, capstyle="round", joinstyle="round",
+        )
+        canvas.create_rectangle(
+            cx - 5 * unit, cy - 3 * unit,
+            cx + 5 * unit, cy + 5.5 * unit,
+            outline=color, width=1,
+        )
+        canvas.create_line(cx - 1.8 * unit, cy - 1 * unit, cx - 1.8 * unit, cy + 3.5 * unit, fill=color)
+        canvas.create_line(cx + 1.8 * unit, cy - 1 * unit, cx + 1.8 * unit, cy + 3.5 * unit, fill=color)
+
+    def purge_note(self, note_id: int) -> None:
+        preview = ""
+        for note in self.store.archived_notes():
+            if int(note["id"]) == int(note_id):
+                preview = str(note.get("content") or "").strip()
+                break
+        if len(preview) > 40:
+            preview = preview[:40] + "…"
+        message = "确定彻底删除这条归档吗？删除后不可恢复。"
+        if preview:
+            message = f"确定彻底删除这条归档吗？\n\n「{preview}」\n\n删除后不可恢复。"
+        try:
+            self.attributes("-topmost", False)
+            self.update_idletasks()
+            ok = messagebox.askyesno("彻底删除", message, parent=self, default="no")
+        finally:
+            self.after(80, self._restore_topmost)
+        if not ok:
+            return
+        if self.store.purge(note_id):
+            self.reload_archive()
+            self.refresh_counts()
 
     def quit_app(self) -> None:
         try:
